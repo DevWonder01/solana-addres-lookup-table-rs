@@ -1,4 +1,5 @@
 Solana Address Lookup Table (ALT) Creator
+
 This Rust utility provides a simple, standalone function to create and extend a Solana Address Lookup Table (ALT) on the Mainnet/Devnet. It's designed to be used in projects that require a consistent lookup table to reduce transaction size and avoid the "transaction too large" error.
 
 How to Use
