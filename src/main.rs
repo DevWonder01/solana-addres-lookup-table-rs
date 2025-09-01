@@ -1,111 +1,166 @@
+use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_program::sysvar;
+use solana_sdk::address_lookup_table::{
+    instruction::{create_lookup_table, extend_lookup_table},
+    state::AddressLookupTable,
+};
 use solana_sdk::{
     commitment_config::CommitmentConfig, instruction::Instruction, pubkey::Pubkey,
     signature::Keypair, signer::Signer, transaction::Transaction,
 };
-use solana_client::nonblocking::rpc_client::RpcClient;
-use solana_sdk::address_lookup_table::{
-    instruction::{create_lookup_table, extend_lookup_table},
-    state::{AddressLookupTable},
-};
-use solana_program::{system_instruction, sysvar};
 use std::error::Error;
-use std::str::FromStr;
 use std::sync::Arc;
-use tokio::time::{Duration, sleep};
-use anyhow::Result;
+use tokio;
+
+use solana_sdk::{
+    message::{ VersionedMessage, v0},
+    transaction::VersionedTransaction,
+};
+
+use solana_sdk::address_lookup_table::AddressLookupTableAccount;
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // Call the async function and unwrap the result to get the Pubkey
     let lookup_table_address = create_atl_address().await?;
-    
-    println!("\nSuccessfully created and extended ALT at address: {}", lookup_table_address);
+
+    println!(
+        "\nSuccessfully created and extended ALT at address: {}",
+        lookup_table_address
+    );
     Ok(())
 }
 
-/// Creates and extends a Solana Address Lookup Table on chain
-/// Requires the `DEV_B58` and `RPC_URL` environment variables to be set.
-/// Returns the Pubkey of the created lookup table.
 pub async fn create_atl_address() -> Result<Pubkey, Box<dyn Error + Send + Sync>> {
-    let dev_key = std::env::var("DEV_B58").unwrap();
-    let payer = Keypair::from_base58_string(&dev_key.as_str());
-
+    let dev_b58 = std::env::var("DEV_KEY").unwrap_or_default();
+    let payer = Keypair::from_base58_string(dev_b58.clone().as_str());
     let rpc_url = std::env::var("RPC_URL").unwrap_or_else(|_| "".to_string());
 
-    let client_connection = Arc::new(
-        RpcClient::new_with_commitment(rpc_url.clone(), CommitmentConfig::processed())
-    );
+    let client_connection = Arc::new(RpcClient::new_with_commitment(
+        rpc_url.clone(),
+        CommitmentConfig::processed(),
+    ));
 
-    // === STEP 1: CREATE THE LOOKUP TABLE ===
-    println!("🏗️ Step 1: Creating Address Lookup Table...");
+    let recent_blockhash = client_connection.get_latest_blockhash().await?;
+    let program_id = Pubkey::new_unique(); // Mock program ID for the example
+
+    let addresses_to_add: Vec<Pubkey> = vec![
+        solana_program::system_program::id(),
+        sysvar::rent::id(),
+        program_id,
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+    ];
 
     let slot = client_connection.get_slot().await?;
-    let (create_ix, lookup_table_address) = create_lookup_table(
-        payer.pubkey(),
-        payer.pubkey(),
-        slot
-    );
+
+    let (create_ix, lookup_table_address) =
+        create_lookup_table(payer.pubkey(), payer.pubkey(), slot);
 
     println!("Creating lookup table at address: {}", lookup_table_address);
 
-    let recent_blockhash = client_connection.get_latest_blockhash().await?;
-    let create_transaction = Transaction::new_signed_with_payer(
+    let raw_account = client_connection
+        .clone()
+        .get_account(&lookup_table_address)
+        .await?;
+
+    let address_lookup_table = AddressLookupTable::deserialize(&raw_account.data)?;
+
+    let address_lookup_table_account = AddressLookupTableAccount {
+        key: lookup_table_address,
+        addresses: address_lookup_table.addresses.to_vec(),
+    };
+
+    let recent_blockhash = client_connection.get_latest_blockhash().await.unwrap();
+
+    let message = v0::Message::try_compile(
+        &payer.pubkey(),
         &[create_ix],
-        Some(&payer.pubkey()),
-        &[&payer],
-        recent_blockhash
-    );
+        &[address_lookup_table_account.clone()],
+        recent_blockhash.clone(),
+    )
+    .unwrap();
 
-    let create_sig = client_connection.send_and_confirm_transaction(&create_transaction).await?;
-    println!("✅ ALT created! Signature: {}", create_sig);
+    let create_txn = VersionedTransaction::try_new(VersionedMessage::V0(message), &[payer])?;
+    let create_sig = client_connection
+        .send_and_confirm_transaction_with_spinner_and_commitment(
+            &create_txn,
+            CommitmentConfig::processed(),
+        )
+        .await?;
+    println!("Create transaction confirmed: {}", create_sig);
 
-    println!("⏳ Waiting for ALT to be available...");
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    // --- Step 2: Extend the Address Lookup Table ---
 
-    // === STEP 2: ADD WSOL,PROGRAM,WALLET,PDAs,ATA AND REPEATED ADDRESSES ===
-    let addresses_to_add: Vec<Pubkey> = vec![
-        // Core Solana programs (most frequently used)
-        solana_program::system_program::id(), // System Program
-        spl_token::id(), // Token Program
-        spl_associated_token_account::id(), // ATA Program
-        sysvar::rent::id(), // Rent Sysvar
-        // Token mints
-        Pubkey::from_str("So11111111111111111111111111111111111111112")?, // WSOL
-    ];
-
-    println!("Adding {} addresses to ALT:", addresses_to_add.len());
-    for (i, addr) in addresses_to_add.iter().enumerate() {
-        println!("  [{}] {}", i, addr);
-    }
+    let payer_arc = Arc::from(Keypair::from_base58_string(dev_b58.as_str().clone()));
+    let recent_blockhash = client_connection.get_latest_blockhash().await.unwrap();
 
     let extend_ix = extend_lookup_table(
         lookup_table_address,
-        payer.pubkey(),
-        Some(payer.pubkey()),
-        addresses_to_add
+        payer_arc.clone().pubkey(),
+        Some(payer_arc.clone().pubkey()),
+        addresses_to_add,
     );
 
-    let recent_blockhash = client_connection.get_latest_blockhash().await?;
-    let extend_transaction = Transaction::new_signed_with_payer(
+    let extend_msg = v0::Message::try_compile(
+        &payer_arc.pubkey(),
         &[extend_ix],
-        Some(&payer.pubkey()),
-        &[&payer],
-        recent_blockhash
-    );
+        &[address_lookup_table_account.clone()],
+        recent_blockhash.clone(),
+    )
+    .unwrap();
 
-    let extend_sig = client_connection.send_and_confirm_transaction(&extend_transaction).await?;
-    println!("✅ ALT extended! Signature: {}", extend_sig);
+    let extend_txn =
+        VersionedTransaction::try_new(VersionedMessage::V0(extend_msg), &[&*payer_arc.clone()])?;
 
-    println!("⏳ Waiting for addresses to be added...");
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let extend_sig = client_connection
+        .send_and_confirm_transaction_with_spinner_and_commitment(
+            &extend_txn,
+            CommitmentConfig::processed(),
+        )
+        .await
+        .unwrap();
 
-    // === STEP 3: VERIFY THE LOOKUP TABLE ===
-    println!("🧪 Step 3: Verifying lookup table...");
+    println!("Extend transaction confirmed: {}", extend_sig);
 
-    let table_account = client_connection.get_account(&lookup_table_address).await?;
+    // Fetch the account to get the latest addresses and table state.
+    let table_account = client_connection
+        .get_account(&lookup_table_address)
+        .await
+        .unwrap();
 
     let lookup_table = AddressLookupTable::deserialize(&table_account.data)?;
-    println!("✅ ALT now contains {} addresses", lookup_table.addresses.len());
+
+    let recent_blockhash = client_connection.get_latest_blockhash().await.unwrap();
+
+    let addresses_to_lookup: Vec<Pubkey> = lookup_table.addresses.to_vec();
+    let mut instructions: Vec<Instruction> = vec![];
+    instructions.push(solana_sdk::system_instruction::transfer(
+        &payer_arc.clone().pubkey(),
+        &addresses_to_lookup[2], // Using the program_id from our table
+        10_000,
+    ));
+
+    // Pass the lookup table to `try_compile`!
+    let message = v0::Message::try_compile(
+        &payer_arc.clone().pubkey(),
+        &instructions,
+        &[address_lookup_table_account.clone()],
+        recent_blockhash,
+    )?;
+
+    let final_txn =
+        VersionedTransaction::try_new(VersionedMessage::V0(message), &[&payer_arc.clone()])?;
+    let final_sig = client_connection
+        .send_and_confirm_transaction_with_spinner_and_commitment(
+            &final_txn,
+            CommitmentConfig::processed(),
+        )
+        .await
+        .unwrap();
+
+    println!("Final transaction using ALT sent! Signature: {}", final_sig);
 
     Ok(lookup_table_address)
 }
