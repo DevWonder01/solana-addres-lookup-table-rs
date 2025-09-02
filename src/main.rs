@@ -77,7 +77,7 @@ pub async fn create_atl_address() -> Result<Pubkey, Box<dyn Error + Send + Sync>
     let message = v0::Message::try_compile(
         &payer.pubkey(),
         &[create_ix],
-        &[address_lookup_table_account.clone()],
+        &[],
         recent_blockhash.clone(),
     )
     .unwrap();
@@ -106,7 +106,7 @@ pub async fn create_atl_address() -> Result<Pubkey, Box<dyn Error + Send + Sync>
     let extend_msg = v0::Message::try_compile(
         &payer_arc.pubkey(),
         &[extend_ix],
-        &[address_lookup_table_account.clone()],
+        &[],
         recent_blockhash.clone(),
     )
     .unwrap();
